@@ -3,97 +3,34 @@
 [![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Stellar--Qwen3--8B--ARM-blue)](https://huggingface.co/Stellar-lab/Stellar-Qwen3-8B-ARM)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Base Model: Qwen3-8B](https://img.shields.io/badge/Base%20Model-Qwen%2FQwen3--8B-orange)](https://huggingface.co/Qwen/Qwen3-8B)
-[![Architecture: Associative Reward Model](https://img.shields.io/badge/Architecture-Causal%20DAG%20ARM-purple)](#model-overview--architecture)
 
-**Stellar-Qwen3-8B-ARM** (`StellarQwen3ARMForRewardModeling`) is an open-weights **Associative Reward Model (ARM)** built on top of **`Qwen/Qwen3-8B`**. Instead of compressing complex human preferences directly into a single unanchored scalar logit, it evaluates responses across six explicit rubric dimensions using in-backbone directed causal query routing, analytic monotonicity constraints, and non-compensatory gatekeeper penalties.
-
----
-
-## Model Overview & Architecture
-
-Traditional scalar Bradley-Terry reward models collapse multi-faceted quality criteria into a single opaque score, allowing surface fluency or verbosity to compensate for broken reasoning, factual errors, or violated instructions. **Stellar-Qwen3-8B-ARM** prevents this structural compensation through four core architectural mechanisms:
-
-```
-[Prompt + Response Tokens] ───► Full Context Self-Attention
-                                       │
-                                       ▼
-                     [K=6 Dimension Query Tokens]
-                                       │
-            ┌──────────────────────────┴──────────────────────────┐
-            ▼                                                     ▼
-In-Backbone 4D DAG Masking                             Causal DAG Projection
-(Lower-triangular causal routing)                      (2-layer CausalDAGLayer)
-            │                                                     │
-            ▼                                                     ▼
-Prerequisite Softmin Ceiling                           Log-Odds Gatekeeper Veto
-(z5_mono bounded by z3 & z4)                           (LRSV penalty on D1, D4, D5)
-            │                                                     │
-            └──────────────────────────┬──────────────────────────┘
-                                       ▼
-                       Scalar Reward Logit R(x, y) 
-                     + 6D Disentangled Rubric Scores
-```
-
-### 1. Six-Dimension Rubric Query Appending
-The model appends $K=6$ learnable query embeddings (`query_embeds` $\in \mathbb{R}^{1 \times 6 \times 4096}$) to the end of the tokenized prompt-response sequence, corresponding to a structured hierarchy of evaluation dimensions:
-
-1. **`D1_INSTRUCTION_ADHERENCE`**: Compliance with explicit user constraints, formatting rules, and safety boundaries.
-2. **`D2_RELEVANCE`**: Directness and topical alignment with the prompt intent.
-3. **`D3_COMPLETENESS`**: Thoroughness and absence of premature truncation or omitted implementation steps.
-4. **`D4_REASONING_VALIDITY`**: Step-by-step logical coherence and intermediate derivation soundness.
-5. **`D5_TASK_CORRECTNESS`**: Final factual, mathematical, or functional execution accuracy.
-6. **`D6_COMMUNICATION_QUALITY`**: Clarity, organization, formatting, and presentation style.
+**Stellar-Qwen3-8B-ARM** (`StellarQwen3ARMForRewardModeling`) is an open-weights **Associative Reward Model (ARM)** built on top of **`Qwen/Qwen3-8B`**. Instead of compressing complex human preferences into a single opaque scalar score, it evaluates responses across six explicit rubric dimensions using custom in-backbone Directed Acyclic Graph (DAG) query routing, analytic monotonicity gating, and non-compensatory veto penalties.
 
 ---
 
-### 2. In-Backbone 4D Directed Causal Attention Masking
-During the forward pass through the `Qwen3-8B` transformer layers, a custom 4D attention mask (`build_4d_attention_mask`) allows all six query tokens to attend to the full prompt-response context while enforcing a strict lower-triangular Directed Acyclic Graph (DAG) over the $6 \times 6$ query-to-query submatrix. Query-to-query attention logits are modulated by a length-scaled structural prior:
+## Model Architecture
 
-$$B_{i,j}(L) = \mathbb{I}(i > j) \cdot \left( \frac{1}{2}\ln(L)\,\sigma(\Gamma_{i,j}) + P_{i,j} \right)$$
+Traditional scalar reward models collapse all criteria into a single score, allowing superficial eloquence or length to compensate for factual errors and broken reasoning. **Stellar-Qwen3-8B-ARM** eliminates this failure mode using:
 
-where $L$ is the active sequence length, $\Gamma \in \mathbb{R}^{6 \times 6}$ is a learnable bias matrix, and $P_{i,j}$ encodes structural priors linking Completeness ($D_3$) and Reasoning Validity ($D_4$) to Task Correctness ($D_5$) ($P_{5,4}=2.5$, $P_{5,3}=2.0$, $P_{4,3}=1.5$). 
-
-This ensures downstream correctness and style representations are conditioned on upstream reasoning and completeness states without reverse leakage from surface style ($D_6$) into correctness ($D_5$) or reasoning ($D_4$).
-
----
-
-### 3. Causal DAG Projection & Analytic Softmin Monotonicity Readout
-The final hidden states of the six query tokens are projected into a 512-dimensional subspace (`dag_down_proj` + `LayerNorm`), processed through gated lower-triangular `CausalDAGLayer` self-attention blocks, and mapped via six independent linear heads (`dim_heads`) into raw dimension logits $z \in [-15, 15]^6$.
-
-To enforce the structural invariant that task correctness ($D_5$) cannot exceed the quality of its prerequisite completeness ($D_3$) and reasoning validity ($D_4$), the $D_5$ logit is bounded analytically via a smooth softmin prerequisite ceiling:
-
-$$z_{\text{prereq}} = -\tau \ln \left( \exp\left(-\frac{z_3}{\tau}\right) + \exp\left(-\frac{z_4}{\tau}\right) \right) + \tau \ln(2)$$
-
-$$z_5^{\text{mono}} = \text{clamp}\Big( z_{\text{prereq}} + \delta_{\text{tol}} - \text{softplus}(-z_5),\ -15.0,\ 15.0 \Big)$$
-
-with temperature $\tau = 0.5$ and tolerance $\delta_{\text{tol}} = 0.20$. Dimension probabilities are obtained via $s_k = \sigma(z_k) \in (0, 1)$.
-
----
-
-### 4. Log-Odds Gatekeeper Veto Aggregation (LRSV)
-To synthesize a single scalar preference logit $R(x, y)$ for ranking and RLHF without allowing high communication quality ($D_6$) to mask critical failures, the model combines a softmax-weighted linear aggregation over all six dimensions with a softplus-activated LogSumExp veto penalty over three core gatekeeper dimensions ($G = \{D_1, D_4, D_5\}$):
-
-$$R(x, y) = \beta_{\text{lin}} \sum_{k=1}^{6} w_k z_k - \frac{\lambda_{\text{veto}}}{\kappa} \ln \left( 1 + \sum_{g \in G} \exp\big(-\kappa(z_g - \theta_g)\big) \right)$$
-
-where $w = \text{softmax}(\alpha)$ are learnable aggregation weights, $\theta_g$ are learnable per-gatekeeper thresholds, $\lambda_{\text{veto}} = \text{softplus}(\hat{\lambda})$, and $\kappa = 1.5$.
+1. **6D Rubric Query Routing:** Appends six dedicated query tokens to evaluate **Instruction Adherence** ($D_1$), **Relevance** ($D_2$), **Completeness** ($D_3$), **Reasoning Validity** ($D_4$), **Task Correctness** ($D_5$), and **Communication Quality** ($D_6$).
+2. **In-Backbone Custom DAG Attention:** Enforces a lower-triangular causal attention mask so downstream representations (like style and correctness) are conditioned on upstream reasoning and completeness, preventing superficial style from leaking into or overriding core correctness.
+3. **Monotonicity Readout:** Enforces an analytic softmin prerequisite ceiling ensuring task correctness cannot outscore prerequisite completeness and reasoning.
+4. **Non-Compensatory Gatekeeper Veto:** Uses a softplus-activated penalty on core gatekeeper dimensions ($D_1, D_4, D_5$) to ensure that fatal factual or safety failures trigger an immediate score drop, regardless of how articulate the text is.
 
 ---
 
 ## Training Details
 
-- **Base Architecture:** `Qwen/Qwen3-8B` merged into standalone `StellarQwen3ARMForRewardModeling` weights (`FP16`).
-- **Training Method:** 4-bit NF4 QLoRA fine-tuning ($r=16$, $\alpha=32$) with full FP32 custom DAG & rubric heads, merged into full-precision safetensor shards for standalone inference.
-- **Supervision Signals (13-Signal Hybrid Loss):** Jointly optimized under:
-  - Pairwise Bradley-Terry preference loss ($w_{\text{pref}}=1.0$)
-  - Entropy-calibrated 6D soft binary cross-entropy across chosen and rejected rubric targets ($w_{\text{dim}}=4.0$)
-  - Counterfactual activation-patching consistency loss ($w_{\text{consist}}=2.0$)
-- **Dataset Scale:** Trained on 7,500 curated preference pairs across 7 alignment regimes (HelpSteer2 General, Math Reasoning, MBPP/Code AST Bugs, IFEval Constraints, Truncated/Incomplete, Off-Diagonal Style-vs-Correctness, Safety Refusal).
+- **Base Model:** `Qwen/Qwen3-8B` merged into standalone weights (`FP16`).
+- **Method:** 4-bit NF4 QLoRA fine-tuning with full-precision custom DAG and rubric heads, merged into safetensors for direct inference.
+- **Loss:** 13-signal hybrid loss combining pairwise preference loss, 6D soft binary cross-entropy, and counterfactual activation-patching consistency loss.
+- **Dataset:** Trained on 7,500 curated preference pairs across 7 alignment regimes.
 
 ---
 
-## Quickstart: How to Load & Score with the Model
+## Quickstart
 
-The model weights are fully merged and packaged with custom remote modeling code (`modeling_stellar_arm.py`). No external adapter loading is required—load directly via `AutoModelForSequenceClassification` with `trust_remote_code=True`:
+Load directly via `transformers` with `trust_remote_code=True`:
 
 ```python
 import torch
@@ -101,13 +38,13 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 model_id = "Stellar-lab/Stellar-Qwen3-8B-ARM"
 
-# 1. Load tokenizer with left-padding
+# 1. Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
 tokenizer.padding_side = "left"
 
-# 2. Load model (FP16 partitioned across GPUs, or NF4 on single GPU)
+# 2. Model
 model = AutoModelForSequenceClassification.from_pretrained(
     model_id,
     trust_remote_code=True,
@@ -117,32 +54,29 @@ model = AutoModelForSequenceClassification.from_pretrained(
 )
 model.eval()
 
-# 3. Score a prompt-response pair
+# 3. Score a pair
 prompt = "User: Explain why dividing by zero is undefined.\nAssistant: "
-response = "Division by zero is undefined because no real number multiplied by 0 equals a non-zero dividend."
+response = "Division by zero is undefined because no number multiplied by 0 equals a non-zero dividend."
 
 device = model.backbone.get_input_embeddings().weight.device
 inputs = tokenizer(prompt + response, return_tensors="pt").to(device)
 
 with torch.no_grad():
     out = model(**inputs)
-    
-    scalar_reward = out.logits.item()              # Scalar preference logit R(x, y)
-    rubric_scores = out.dim_scores[0].tolist()     # [D1_Adh, D2_Rel, D3_Comp, D4_Reas, D5_Corr, D6_Comm] in (0, 1)
+    scalar_reward = out.logits.item()              # Overall scalar preference score
+    rubric_scores = out.dim_scores[0].tolist()     # [D1_Adh, D2_Rel, D3_Comp, D4_Reas, D5_Corr, D6_Comm]
     veto_penalty  = out.veto_penalty.item()         # Non-compensatory gatekeeper penalty
 
-print(f"Scalar Reward : {scalar_reward:.4f}")
-print(f"Veto Penalty  : {veto_penalty:.4f}")
-print("Rubric Scores:")
-for dim, score in zip(["Adherence", "Relevance", "Completeness", "Reasoning", "Correctness", "Quality"], rubric_scores):
-    print(f"  - {dim:<14}: {score:.4f}")
+print(f"Scalar Reward: {scalar_reward:.4f}")
+print(f"Veto Penalty : {veto_penalty:.4f}")
+print(f"Rubric Scores: {rubric_scores}")
 ```
 
 ---
 
 ## Benchmark Results
 
-Evaluation across official standard alignment and reasoning benchmarks shows that **Stellar-Qwen3-8B-ARM** outperforms substantially larger models and commercial judges:
+Evaluation across standard alignment and reasoning benchmarks demonstrates that **Stellar-Qwen3-8B-ARM** outperforms larger baseline reward models and commercial judges:
 
 | Benchmark | Dataset | Evaluation Scope | Primary Score | Outperformed Baselines | Notebook |
 | :--- | :--- | :--- | :---: | :--- | :--- |
@@ -153,11 +87,10 @@ Evaluation across official standard alignment and reasoning benchmarks shows tha
 
 ---
 
-### Detailed Comparisons & Figures
+### Benchmark Figures
 
 #### 1. RewardBench 1
-* **Chat:** `92.36%` | **Chat Hard:** `83.20%` | **Safety:** `90.21%`
-* **Reasoning (7-Subset Macro):** `90.54%` (`hep-*` Code Mean: `96.24%`, `math-prm`: `56.38%`)
+* **Chat:** `92.36%` | **Chat Hard:** `83.20%` | **Safety:** `90.21%` | **Reasoning (Macro):** `90.54%`
 * **Overall (Subset Macro-Avg):** **89.08%** | **Overall (50/50 Math+Code Weighted):** **85.52%**
 
 ![RewardBench 1 Comparison](assets/rewardbench1_comparison.png)
@@ -187,11 +120,8 @@ Evaluation across official standard alignment and reasoning benchmarks shows tha
 
 ```text
 stellar-arm/
-├── assets/                                  # Exported 300-DPI benchmark comparison figures
-│   ├── judgebench_comparison.png
-│   ├── rewardbench1_comparison.png
-│   ├── rewardbench2_comparison.png
-│   └── rmbench_comparison.png
+├── assets/                                  # 300-DPI benchmark comparison figures
+├── ablations/                               # 7 ablation experiments and analysis
 ├── stellar-judgebench-evaluation.ipynb      # JudgeBench evaluation notebook
 ├── stellar-rewardbench1-evaluation.ipynb    # RewardBench 1 evaluation notebook
 ├── stellar-rewardbench2-evaluation.ipynb    # RewardBench 2 evaluation notebook
@@ -203,24 +133,17 @@ stellar-arm/
 
 ---
 
-## Hardware & Environment Requirements
+## Hardware Requirements
 
-* **CUDA GPU Required:**
-  * **Multi-GPU ($\ge 2$ GPUs):** Automatically partitions the FP16 model using `device_map="auto"` (requires $\approx 13.0\text{ GiB}$ VRAM per GPU).
-  * **Single GPU ($1$ GPU):** Automatically quantized to 4-bit NF4 via `BitsAndBytesConfig`.
-* **Verified Runtime Environment:**
-  * Python `3.13.16` / PyTorch `2.11.0+cu130` (CUDA `13.0`)
-  * `transformers>=4.44.0`, `accelerate>=0.33.0`, `bitsandbytes>=0.46.1`, `datasets>=2.20.0`
+- **Multi-GPU ($\ge 2$ GPUs):** Automatically partitions the FP16 model via `device_map="auto"` ($\approx 13.0\text{ GiB}$ VRAM per GPU).
+- **Single GPU ($1$ GPU):** Can be loaded in 4-bit NF4 using `BitsAndBytesConfig`.
 
 ---
 
 ## Intended Use & Limitations
 
-* **Intended Use:** Multi-objective reward modeling, interpretable 6D rubric scoring ($D_1 \dots D_6$), Best-of-$N$ test-time reranking, alignment auditing, and RLHF/DPO preference filtering.
-* **Limitations:**
-  * As an 8B parameter model fine-tuned on 7,500 curated preference pairs, evaluations on highly specialized or out-of-distribution domains (e.g. obscure medical or specialized legal compliance) should be calibrated against domain-specific rubrics.
-  * Context length is bounded at 1280 tokens during standard evaluation; responses exceeding token limits are subject to truncation preservation rules.
-  * The non-compensatory veto is sensitive to extreme negative outliers in gatekeeper dimensions ($D_1, D_4, D_5$), which may intentionally reject answers that are stylistically fluent but fundamentally incorrect.
+- **Intended Use:** Multi-objective reward modeling, 6D rubric evaluation, Best-of-$N$ test-time reranking, and RLHF/DPO preference filtering.
+- **Limitations:** As an 8B parameter model fine-tuned on 7,500 curated pairs, evaluations on specialized or out-of-distribution domains should be calibrated with domain-specific rubrics. The non-compensatory veto is sensitive to critical failures in gatekeeper dimensions ($D_1, D_4, D_5$) and will penalize responses that are articulate but fundamentally incorrect.
 
 ---
 
@@ -236,4 +159,4 @@ stellar-arm/
 
 ## License
 
-This project is licensed under the **Apache License 2.0** — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the [Apache License 2.0](LICENSE).
