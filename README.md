@@ -116,12 +116,43 @@ Evaluation across standard alignment and reasoning benchmarks demonstrates that 
 
 ---
 
+## Ablation & Robustness Audits
+
+To isolate the contribution of each architectural component (`SCALAR_RM` → `INDEPENDENT_6D` → `STELLAR_NO_VETO` → `STELLAR_FULL`), we run apples-to-apples 4-way audits using only `scalar_logit` (actual RM reward) alongside the 7 individual ablation notebooks in [`ablations/`](ablations/).
+
+### 1. Out-of-Distribution Style-Trap Audit (`THU-KEG/RM-Bench`)
+Evaluates 1,327 prompts (7,962 sequences across 3 chosen × 3 rejected style levels) in [`ablations-4way-rmbench-ood-audit.ipynb`](ablations/audits/ablations-4way-rmbench-ood-audit.ipynb):
+
+| Model | Overall | Easy | Normal | Hard (Style Trap) | Style Gap (Easy − Hard) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **SCALAR_RM** | 73.18% | **86.08%** | 75.91% | 57.55% | 28.54 pp |
+| **INDEPENDENT_6D** | 73.64% | 84.75% | **76.14%** | 60.04% | 24.72 pp |
+| **STELLAR_NO_VETO** | 73.83% | 84.88% | 75.81% | 60.81% | 24.06 pp |
+| **STELLAR_FULL** | **74.31%** | 82.74% | 75.91% | **64.28%** | **18.46 pp** |
+
+* **Key Takeaway:** `STELLAR_FULL` achieves the highest overall accuracy (**74.31%**), outperforms `SCALAR_RM` by **+6.73 pp** on **Hard** style traps (**64.28%** vs. **57.55%**), and reduces the Easy − Hard style bias gap by **10.08 pp** (**18.46 pp** vs. **28.54 pp**).
+
+### 2. In-Distribution Failure-Mode & Style-Padding Audit
+Evaluates the 750-pair held-out `arm_test_benchmark.parquet` plus a synthetic fluff-padded rejected split in [`ablations-4way-failure-mode-audit.ipynb`](ablations/audits/ablations-4way-failure-mode-audit.ipynb):
+
+| Model | Test Acc | R6 Style Trap | R6 Margin | R7 Safety | Padded Acc | Style Flip (All) | Veto $\lambda$ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **SCALAR_RM** | 92.67% | 95.0% | +7.263 | 96.0% | 95.60% | 0.86% | 0.000 |
+| **INDEPENDENT_6D** | **93.73%** | 95.0% | +2.085 | 97.0% | 95.60% | 0.85% | 0.000 |
+| **STELLAR_NO_VETO** | **93.73%** | 95.0% | +1.973 | 96.0% | 95.07% | 1.00% | 0.000 |
+| **STELLAR_FULL** | 92.93% | 94.0% | +5.034 | **98.0%** | **97.60%** | **0.29%** | 2.020 |
+
+* **Key Takeaway:** Under adversarial fluff padding, `STELLAR_FULL` achieves the lowest style-flip rate (**0.29%** vs. **0.85%–1.00%**), highest padded accuracy (**97.60%**), highest **R7 Safety** accuracy (**98.0%**), and **0.0%** Level-C violations.
+
+---
+
 ## Repository Structure
 
 ```text
 stellar-arm/
 ├── assets/                                  # 300-DPI benchmark comparison figures
-├── ablations/                               # 7 ablation experiments and analysis
+├── ablations/                               # 7 ablation experiments and 4-way audits
+│   └── audits/                              # 4-way cross-model OOD & failure-mode audit notebooks
 ├── stellar-judgebench-evaluation.ipynb      # JudgeBench evaluation notebook
 ├── stellar-rewardbench1-evaluation.ipynb    # RewardBench 1 evaluation notebook
 ├── stellar-rewardbench2-evaluation.ipynb    # RewardBench 2 evaluation notebook
